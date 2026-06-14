@@ -1,0 +1,12 @@
+[package]
+name = "axum_cgi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false }
+futures = { version = "0.3.32", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+tokio = { version = "1.52.3", default-features = false, features = ["io-std", "io-util"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["io"] }
+tower = { version = "0.5.3", default-features = false }
