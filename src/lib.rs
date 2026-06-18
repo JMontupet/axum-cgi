@@ -24,6 +24,8 @@ pub enum Error {
     #[error(transparent)]
     Axum(#[from] axum::Error),
     #[error(transparent)]
+    InvalidMethod(#[from] http::method::InvalidMethod),
+    #[error(transparent)]
     InvalidHeaderName(#[from] http::header::InvalidHeaderName),
     #[error(transparent)]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
@@ -70,7 +72,7 @@ async fn write_axum_response(
     let (parts, body) = response.into_parts();
 
     // Status
-    writer.write_all(b"status: ").await?;
+    writer.write_all(b"Status: ").await?;
     writer.write_all(parts.status.as_str().as_bytes()).await?;
     writer.write_all(b" ").await?;
     writer
@@ -82,7 +84,7 @@ async fn write_axum_response(
                 .as_bytes(),
         )
         .await?;
-    writer.write_all(b"\n").await?;
+    writer.write_all(b"\r\n").await?;
 
     // Headers
     for (name, value) in parts.headers {
@@ -90,12 +92,12 @@ async fn write_axum_response(
             writer.write_all(name.as_ref()).await?;
             writer.write_all(b": ").await?;
             writer.write_all(value.as_ref()).await?;
-            writer.write_all(b"\n").await?;
+            writer.write_all(b"\r\n").await?;
         }
     }
 
     // Blank line
-    writer.write_all(b"\n").await?;
+    writer.write_all(b"\r\n").await?;
 
     // Body
     let mut body = body.into_data_stream();
@@ -112,14 +114,51 @@ fn request_from_map(
 ) -> Result<Request<Option<u64>>, Error> {
     let mut builder = Builder::new();
     let mut content_length: Option<u64> = None;
+
+    let mut raw_uri: Option<String> = None;
+    let mut path_info = String::new();
+    let mut query_string = String::new();
+    let mut host_header: Option<String> = None;
+    let mut server_name = String::new();
+    let mut server_port = String::new();
+    let mut is_https = false;
+
     for (key, value) in env {
-        match key.to_string_lossy().as_ref() {
+        let key_str = match key.to_str() {
+            Some(k) => k,
+            None => continue,
+        };
+
+        match key_str {
             "REQUEST_METHOD" => {
-                builder = builder.method(value.to_string_lossy().into_owned().as_str());
+                let method_str = value.to_string_lossy();
+                let method = http::Method::from_bytes(method_str.as_bytes())?;
+                builder = builder.method(method);
             }
-            "REQUEST_URI" => builder = builder.uri(value.to_string_lossy().into_owned()),
+            "REQUEST_URI" => {
+                raw_uri = Some(value.to_string_lossy().into_owned());
+            }
+            "PATH_INFO" => {
+                path_info = value.to_string_lossy().into_owned();
+            }
+            "QUERY_STRING" => {
+                query_string = value.to_string_lossy().into_owned();
+            }
+            "HTTPS" => {
+                let val = value.to_string_lossy();
+                if val == "on" || val == "1" || val == "yes" {
+                    is_https = true;
+                }
+            }
+            "SERVER_NAME" => {
+                server_name = value.to_string_lossy().into_owned();
+            }
+            "SERVER_PORT" => {
+                server_port = value.to_string_lossy().into_owned();
+            }
             "SERVER_PROTOCOL" => {
-                let version = match value.to_string_lossy().as_ref() {
+                let protocol_lossy = value.to_string_lossy();
+                let version = match protocol_lossy.as_ref() {
                     "HTTP/0.9" => Ok(http::Version::HTTP_09),
                     "HTTP/1.0" => Ok(http::Version::HTTP_10),
                     "HTTP/1.1" => Ok(http::Version::HTTP_11),
@@ -130,24 +169,36 @@ fn request_from_map(
                 builder = builder.version(version);
             }
             "CONTENT_LENGTH" => {
-                let value = value
-                    .to_string_lossy()
-                    .parse()
-                    .map_err(|_| Error::InvalidContentLength)?;
-                content_length = Some(value);
-                builder = builder.header(
-                    http::header::CONTENT_LENGTH,
-                    http::header::HeaderValue::from(value),
-                );
+                let len_lossy = value.to_string_lossy();
+                if !len_lossy.is_empty() {
+                    let parsed_len = len_lossy.parse().map_err(|_| Error::InvalidContentLength)?;
+                    content_length = Some(parsed_len);
+                    builder = builder.header(
+                        http::header::CONTENT_LENGTH,
+                        http::header::HeaderValue::from(parsed_len),
+                    );
+                }
             }
             "CONTENT_TYPE" => {
+                let val_lossy = value.to_string_lossy();
+                if !val_lossy.is_empty() {
+                    builder = builder.header(
+                        http::header::CONTENT_TYPE,
+                        http::header::HeaderValue::from_bytes(value.as_encoded_bytes())?,
+                    );
+                }
+            }
+            "HTTP_HOST" => {
+                let host_val = value.to_string_lossy().into_owned();
+                host_header = Some(host_val.clone());
                 builder = builder.header(
-                    http::header::CONTENT_TYPE,
+                    http::header::HOST,
                     http::header::HeaderValue::from_bytes(value.as_encoded_bytes())?,
                 );
             }
             key_str if key_str.starts_with("HTTP_") => {
-                let header_name_str = key_str["HTTP_".len()..].to_lowercase().replace('_', "-");
+                let header_name_str = key_str["HTTP_".len()..].replace('_', "-");
+
                 builder = builder.header(
                     http::header::HeaderName::from_bytes(header_name_str.as_bytes())?,
                     http::header::HeaderValue::from_bytes(value.as_encoded_bytes())?,
@@ -155,6 +206,37 @@ fn request_from_map(
             }
             _ => {}
         }
+    }
+
+    let uri_string = match raw_uri {
+        Some(uri) => uri,
+        None => {
+            let mut fallback = if path_info.is_empty() {
+                "/".to_string()
+            } else {
+                path_info
+            };
+            if !query_string.is_empty() {
+                fallback.push('?');
+                fallback.push_str(&query_string);
+            }
+            fallback
+        }
+    };
+    builder = builder.uri(uri_string);
+
+    if host_header.is_none() && !server_name.is_empty() {
+        let mut final_host = server_name;
+        if (!is_https && server_port != "80") || (is_https && server_port != "443") {
+            if !server_port.is_empty() {
+                final_host.push(':');
+                final_host.push_str(&server_port);
+            }
+        }
+        builder = builder.header(
+            http::header::HOST,
+            http::header::HeaderValue::from_bytes(final_host.as_bytes())?,
+        );
     }
 
     Ok(builder.body(content_length)?)
